@@ -133,6 +133,7 @@ save_config()
     echo AZURE_RESOURCE_ID=$AZURE_RESOURCE_ID >> $CONF_OMSADMIN
     echo OMSCLOUD_ID=$OMSCLOUD_ID | tr -d ' ' >> $CONF_OMSADMIN
     echo UUID=$UUID | tr -d ' ' >> $CONF_OMSADMIN
+    echo FQDN=$FQDN >> $CONF_OMSADMIN
     chown_omsagent "$CONF_OMSADMIN"
 }
 
@@ -333,7 +334,7 @@ onboard()
 
     local error=0
     if [ -z "$WORKSPACE_ID" -o -z "$SHARED_KEY" ]; then
-        log_error "Missing Wokspace ID or Shared Key information for onboarding"
+        log_error "Missing Workspace ID or Shared Key information for onboarding"
         clean_exit 1
     fi
 
@@ -677,10 +678,12 @@ copy_omsagent_conf()
     make_dir $OMSAGENTD_DIR
 
     cp $SYSCONF_DIR/omsagent.d/monitor.conf $OMSAGENTD_DIR
+    cp $SYSCONF_DIR/omsagent.d/heartbeat.conf $OMSAGENTD_DIR
     cp $SYSCONF_DIR/omsagent.d/operation.conf $OMSAGENTD_DIR
     cp $SYSCONF_DIR/omi_mapping.json $OMSAGENTD_DIR
 
     update_path $OMSAGENTD_DIR/monitor.conf
+    update_path $OMSAGENTD_DIR/heartbeat.conf
 
     chown_omsagent $OMSAGENTD_DIR/*
 }
