@@ -1,10 +1,13 @@
 require 'openssl'
 require 'fileutils'
 require 'net/http'
+require 'uri'
+require 'optparse'
 
 module MaintenanceModule
 
   class Maintenance
+    require_relative 'oms_common'
 
     # Constants
     attr_reader :AGENT_USER, :string
@@ -21,7 +24,7 @@ module MaintenanceModule
   
     def initialize(omsadmin_conf_path, cert_path, key_path, proxy_path, os_info, install_info)
       @AGENT_USER = "omsagent"
-      @AGENT_GROUP = "omsagent"
+      @AGENT_GROUP = "omiusers"
       @TOPOLOGY_REQ_SCRIPT = "/opt/microsoft/omsagent/plugin/agent_topology_request_script.rb"
       @RUBY = "/opt/microsoft/omsagent/ruby/bin/ruby"
       @omsadmin_conf_path = omsadmin_conf_path
@@ -40,12 +43,12 @@ module MaintenanceModule
 
     # Return true if the current executing user is root
     def is_current_user_root
-      return %x(id -u) == "0"
+      return true if %x(id -u) == "0"
     end
 
     # Return true if the user should be running this script (root or omsagent)
     def check_user
-      return is_current_user_root or %x(id -un) == @AGENT_USER
+      return true if (is_current_user_root or %x(id -un) == @AGENT_USER)
     end
 
     # Return variable derived from install_info.txt (like "LinuxMonitoringAgent/1.2.0-148")
@@ -67,12 +70,18 @@ module MaintenanceModule
     # Logging methods
     def log_info(message)
       print("info\t#{message}\n")
-      %x(logger -i -p #{@LOG_FACILITY}.info -t omsagent "#{message}")
+      #%x(logger -i -p #{@LOG_FACILITY}.info -t omsagent "#{message}")
+      $log.info(message)
     end
 
     def log_error(message)
       print("error\t#{message}\n")
-      %x(logger -i -p #{@LOG_FACILITY}.err -t omsagent "#{message}")
+      #%x(logger -i -p #{@LOG_FACILITY}.err -t omsagent "#{message}")
+      $log.error(message)
+    end
+
+    def load_config_help_remove_beginning(line_nnl)
+      return line_nnl[line_nnl.index("=")+1..-1]
     end
 
     # Load necessary configuration values from omsadmin.conf
@@ -84,23 +93,27 @@ module MaintenanceModule
 
       File.open(@omsadmin_conf_path, "r") do |f|
         f.each_line do |line|
-          line_nnl = line[0,line.length-1]  # no newline
+          if line.end_with?("\n")
+            line_nnl = line[0..-2]  # no newline
+          else
+            line_nnl = line
+          end
 
           # Extract variables
           if line_nnl.start_with?("WORKSPACE_ID")
-            @WORKSPACE_ID = line_nnl
+            @WORKSPACE_ID = load_config_help_remove_beginning(line_nnl)
           elsif line_nnl.start_with?("AGENT_GUID")
-            @AGENT_GUID = line_nnl
+            @AGENT_GUID = load_config_help_remove_beginning(line_nnl)
           elsif line_nnl.start_with?("LOG_FACILITY")
-            @LOG_FACILITY = line_nnl
+            @LOG_FACILITY = load_config_help_remove_beginning(line_nnl)
           elsif line_nnl.start_with?("URL_TLD")
             # Ensure URL_TLD is backwards-compatible
             if not line_nnl.end_with?(".com")
               line_nnl += ".com"
             end
-            @URL_TLD = line_nnl
+            @URL_TLD = load_config_help_remove_beginning(line_nnl)
           elsif line_nnl.start_with?("FQDN")
-            @FQDN = line_nnl
+            @FQDN = load_config_help_remove_beginning(line_nnl)
           end
         end
       end
@@ -127,9 +140,21 @@ module MaintenanceModule
       return proxy
     end
 
+    # Updates the DSC_ENDPOINT variable in omsadmin.conf from the server XML
+    def apply_dsc_endpoint(xml_file)
+      # TODO
+#        # Extract the DSC endpoint from the server response
+#        DSC_CONF=`grep -o "<DscConfiguration.*DscConfiguration>" $xml_file`
+#        DSC_ENDPOINT=`echo $DSC_CONF | grep -o "<Endpoint>.*</Endpoint>" | sed -e "s/<.\?Endpoint>//g" -e "s/(/\\\\\(/g" -e "s/)/\\\\\)/g"`
+#
+#        if [ -z "$DSC_ENDPOINT" ]; then
+#            log_error "Could not extract the DSC endpoint."
+#            return 1
+#        fi
+    end
+
 
     def heartbeat
-      require_relative 'oms_common'
       require_relative 'agent_topology_request_script'
       loaded = load_config
       if loaded != 0
@@ -141,36 +166,37 @@ module MaintenanceModule
       cert_file_contents = File.readlines(@cert_path)
       for i in 1..(cert_file_contents.length-2) #skip first and last line in file
         line = cert_file_contents[i]
-        cert_server += line[0,line.length-1]
+        cert_server += line[0..-2]
         if i < (cert_file_contents.length-2)
           cert_server += " "
         end
       end
 
       begin
-        body_hb_xml = AgentTopologyRequestHandler.handle_request(@os_info, @omsadmin_conf_path,
+        body_hb_xml = AgentTopologyRequestHandler.new.handle_request(@os_info, @omsadmin_conf_path,
             @FQDN, @AGENT_GUID, cert_server, telemetry=true)
-      rescue
+      rescue => e
         log_error("Error when appending Telemetry to Heartbeat")
       end
 
-      # Form PUT request with headers
+      # Form POST request with headers
       headers = {}
       req_date = Time.now.utc.strftime("%Y-%m-%dT%T.%N%:z")
       headers[OMS::CaseSensitiveString.new("x-ms-Date")] = req_date
-      headers[OMS::CaseSensitiveString.new("User-Agent")] = get_user_agent
+      # Invalid header 400 is returned when this is included
+#      headers[OMS::CaseSensitiveString.new("User-Agent")] = get_user_agent
       headers[OMS::CaseSensitiveString.new("Accept-Language")] = "en-US"
-      uri = URI("https://#{WORKSPACE_ID}.oms.#{URL_TLD}/AgentService.svc/LinuxAgentTopologyRequest")
-      req = Net::HTTP::Put.new(uri.request_uri, headers)
+      uri = URI.parse("https://#{@WORKSPACE_ID}.oms.#{@URL_TLD}/AgentService.svc/LinuxAgentTopologyRequest")
+      req = Net::HTTP::Post.new(uri.request_uri, headers)
       req.body = body_hb_xml
 
       # Form HTTP
       http = OMS::Common.create_secure_http(uri, get_proxy_info)
-      if File.exist(@cert_path) and File.exist(@key_path)
+      if File.exist?(@cert_path) and File.exist?(@key_path)
         http.cert = OpenSSL::X509::Certificate.new(File.open(@cert_path))
         http.key = OpenSSL::PKey::RSA.new(File.open(@key_path))
       else
-        log_error("Certificates do not exist for heartbeat request")
+        log_error("Certificates for heartbeat request do not exist")
         return 1
       end
 
@@ -184,8 +210,8 @@ module MaintenanceModule
 
       if !res.nil?
         if res.code == "200"
-       # HERHEREHERHEHEREHER
-#          apply_certificate_update_endpoint $RESP_HEARTBEAT
+       # TODO
+#        apply_certificate_update_endpoint $RESP_HEARTBEAT
 #        apply_dsc_endpoint $RESP_HEARTBEAT
 #        log_info "Heartbeat success"
 #
@@ -200,11 +226,8 @@ module MaintenanceModule
         log_error("Error sending the heartbeat. No HTTP code")
         return 1
       end
-      return 0
 
-      if "hi" == "hi"
-        renew_cert
-      end
+      return 0
     end
 
   
@@ -261,35 +284,58 @@ module MaintenanceModule
       generate_certs
     end
 
+    # Dummy method for FluentD's benefit; the output of this input plugin won't be used
+    def enumerate(time)
+      heartbeat
+      dummy_data_item = {
+        "Timestamp"=>OMS::Common.format_time(time)
+      }
+      wrapper = {
+        "DataType"=>"dummyDataType",
+        "IPName"=>"dummyIPName",
+        "DataItems"=>[dummy_data_item]
+      }
+      return wrapper
+    end
+
   end # class Maintenance
 end # module MaintenanceModule
 
 
 if __FILE__ == $0
-
   options = {}
   OptionParser.new do |opts|
-    opts.on("-t", "--[no-]telemetry") do |t|
-      options[:telemetry] = t 
+    opts.on("-h", "--heartbeat") do |h|
+      options[:heartbeat] = h
     end
-  end.parse!  
+    opts.on("-c", "--certificates") do |c|
+      options[:generate_certs] = c
+    end
+    opts.on("-d", "--dsc XML") do |d|
+      options[:apply_dsc_endpoint] = d
+    end
+  end.parse!
 
-  path = ARGV[0]
-  os_info = ARGV[1]
-  conf_omsadmin = ARGV[2]
+  omsadmin_conf_path = ARGV[0]
+  cert_path = ARGV[1]
+  key_path = ARGV[2]
+  proxy_path = ARGV[3]
+  os_info = ARGV[4]
+  install_info = ARGV[5]
 
-  maintenance = MaintenanceModule::Maintenance.new(@omsadmin_conf_path, @cert_path, @key_path, @proxy_path)
+  maintenance = MaintenanceModule::Maintenance.new(omsadmin_conf_path, cert_path, key_path, proxy_path, os_info, install_info)
+  ret_code = 0
+
   if !maintenance.check_user
     maintenance.log_error("This script must be run as root or as the #{maintenance.AGENT_USER} user.")
-    exit 1
+    ret_code = 1
+  elsif options[:heartbeat]
+    ret_code = maintenance.heartbeat
+  elsif options[:generate_certs]
+    ret_code = maintenance.generate_certs
+  elsif options[:apply_dsc_endpoint]
+    ret_code = maintenance.apply_dsc_endpoint(options[:apply_dsc_endpoint])
   end
 
-
-  topology_request.FullyQualfiedDomainName = ARGV[3]
-  topology_request.EntityTypeId = ARGV[4]
-  topology_request.AuthenticationCertificate = ARGV[5] 
-  
-  if options[:telemetry]
-    topology_request.get_telemetry_data(os_info, conf_omsadmin)
-  end
+  exit ret_code
 end

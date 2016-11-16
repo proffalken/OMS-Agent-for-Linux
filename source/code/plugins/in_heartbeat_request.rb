@@ -11,6 +11,7 @@ module Fluent
       super
     end
 
+#    config_param :tag, :string, :default => "heartbeat.request"
     config_param :run_interval, :time, :default => '20m'
     config_param :omsadmin_conf_path, :string
     config_param :cert_path, :string
@@ -45,7 +46,7 @@ module Fluent
         @mutex = Mutex.new
         @thread = Thread.new(&method(:run_periodic))
       else
-        heartbeat
+        enumerate
       end
     end
 
@@ -59,8 +60,10 @@ module Fluent
       end
     end
 
-    def heartbeat
-      @maintenance_script.heartbeat
+    def enumerate
+      time = Time.now.to_f
+      wrapper = @maintenance_script.enumerate(time)
+#      router.emit(nil, time, wrapper) if wrapper
     end
 
     def run_periodic
@@ -71,7 +74,7 @@ module Fluent
         done = @finished
         @mutex.unlock
         if !done
-          heartbeat
+          enumerate
         end
         @mutex.lock
       end
