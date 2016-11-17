@@ -192,7 +192,7 @@ parse_args()
 {
     local OPTIND opt
 
-    while getopts "h?s:w:d:brvp:u:a:c" opt; do
+    while getopts "h?s:w:d:brvp:u:a:clx:X" opt; do
         case "$opt" in
         h|\?)
             usage
@@ -231,6 +231,16 @@ parse_args()
         c) 
             COLLECTD=1
             echo "Setting up collectd for OMS..."
+            ;;
+        l)
+            LIST_WORKSPACES=1
+            ;;
+        x)
+            REMOVE=1
+            WORKSPACE_ID=$OPTARG
+            ;;
+        X)
+            REMOVE_ALL=1
             ;;
         esac
     done
@@ -609,13 +619,36 @@ collectd()
     echo "...Done"
 }
 
-create_workspace_directories()
+remove_workspace()
+{
+    setup_workspace_variables $WORKSPACE_ID
+
+    if [ -d "$CONF_DIR" ]; then
+        log_info "Disable workspace: $WORKSPACE_ID"
+
+        /opt/microsoft/omsagent/bin/service_control disable $WORKSPACE_ID
+    else
+        log_error "Workspace $WORKSPACE_ID doesn't exist"
+    fi
+
+    log_info "Cleanup the folders"
+
+    rm -rf "$TMP_DIR" "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" "$CERT_DIR" "$CONF_DIR"
+    #### TODO:adjust the symlinks
+}
+
+remove_all()
+{
+}
+
+list_workspaces()
+{
+}
+
+setup_workspace_variables()
 {
     VAR_DIR_WS=$VAR_DIR/$1
     ETC_DIR_WS=$ETC_DIR/$1
-
-    make_dir $VAR_DIR_WS
-    make_dir $ETC_DIR_WS
 
     TMP_DIR=$VAR_DIR_WS/tmp
     STATE_DIR=$VAR_DIR_WS/state
@@ -623,6 +656,14 @@ create_workspace_directories()
     LOG_DIR=$VAR_DIR_WS/log
     CERT_DIR=$ETC_DIR_WS/certs
     CONF_DIR=$ETC_DIR_WS/conf
+}
+
+create_workspace_directories()
+{
+    setup_workspace_variables $1
+
+    make_dir $VAR_DIR_WS
+    make_dir $ETC_DIR_WS
 
     make_dir $TMP_DIR
     make_dir $STATE_DIR
@@ -740,8 +781,20 @@ main()
         fi
     fi
 
+    if [ "$REMOVE" = "1" ]; then
+        remove_workspace || clean_exit 1
+    fi
+
+    if [ "$REMOVE_ALL" = "1" ]; then
+        remove_all || clean_exit 1
+    fi
+
     if [ "$ONBOARDING" = "1" ]; then
         onboard || clean_exit 1
+    fi
+
+    if [ "$LIST_WORKSPACES" = "1" ]; then
+        list_workspaces || clean_exit 1
     fi
 
     if [ "$HEARTBEAT"  = "1" ]; then
