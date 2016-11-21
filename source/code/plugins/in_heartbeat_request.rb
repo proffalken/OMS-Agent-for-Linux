@@ -11,7 +11,6 @@ module Fluent
       super
     end
 
-#    config_param :tag, :string, :default => "heartbeat.request"
     config_param :run_interval, :time, :default => '20m'
     config_param :omsadmin_conf_path, :string
     config_param :cert_path, :string
@@ -60,10 +59,9 @@ module Fluent
       end
     end
 
+    # Any data produced by this is NOT sent to an output plugin or ODS
     def enumerate
-      time = Time.now.to_f
-      wrapper = @maintenance_script.enumerate(time)
-#      router.emit(nil, time, wrapper) if wrapper
+      @maintenance_script.heartbeat
     end
 
     def run_periodic

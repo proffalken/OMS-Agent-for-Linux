@@ -41,6 +41,7 @@ INSTALL_INFO=/etc/opt/microsoft/omsagent/sysconf/installinfo.txt
 RUBY=/opt/microsoft/omsagent/ruby/bin/ruby
 AUTH_KEY_SCRIPT=/opt/microsoft/omsagent/bin/auth_key.rb
 TOPOLOGY_REQ_SCRIPT=/opt/microsoft/omsagent/plugin/agent_topology_request_script.rb
+MAINTENANCE_TASKS_SCRIPT=/opt/microsoft/omsagent/plugin/agent_maintenance_script.rb
 
 METACONFIG_PY=/opt/microsoft/omsconfig/Scripts/OMS_MetaConfigHelper.py
 
@@ -52,9 +53,6 @@ FILE_CRT=$CERT_DIR/oms.crt
 SHARED_KEY_FILE=$TMP_DIR/shared_key
 BODY_ONBOARD=$TMP_DIR/body_onboard.xml
 RESP_ONBOARD=$TMP_DIR/resp_onboard.xml
-
-BODY_HEARTBEAT=$TMP_DIR/body_heartbeat.xml
-RESP_HEARTBEAT=$TMP_DIR/resp_heartbeat.xml
 
 BODY_RENEW_CERT=$TMP_DIR/body_renew_cert.xml
 RESP_RENEW_CERT=$TMP_DIR/resp_renew_cert.xml
@@ -82,9 +80,9 @@ usage()
     echo "Onboarding:"
     echo "$basename -w <workspace id> -s <shared key> [-d <top level domain>]"
     echo
-    echo "Heartbeat:"
-    echo "$basename -b"
-    echo
+#    echo "Heartbeat:"
+#    echo "$basename -b"
+#    echo
     echo "Renew certificates:"
     echo "$basename -r"
     echo
@@ -161,7 +159,6 @@ load_config()
 cleanup()
 {
     rm "$BODY_ONBOARD" "$RESP_ONBOARD" > /dev/null 2>&1 || true
-    rm "$BODY_HEARTBEAT" "$RESP_HEARTBEAT" > /dev/null 2>&1 || true
     rm "$BODY_RENEW_CERT" "$RESP_RENEW_CERT" > /dev/null 2>&1 || true
 }
 
@@ -210,9 +207,9 @@ parse_args()
             ONBOARDING=1
             URL_TLD=$OPTARG
             ;;
-        b)
-            HEARTBEAT=1
-            ;;
+#        b)
+#            HEARTBEAT=1
+#            ;;
         r)
             RENEW_CERT=1
             ;;
@@ -261,30 +258,6 @@ parse_args()
         # Suppress curl output
         CURL_VERBOSE=-s
     fi
-}
-
-generate_certs()
-{
-    log_info "Generating certificate ..."
-    local tmp_key="$FILE_KEY.tmp"
-    local error=0
-
-    # Set safe certificate permissions before to prevent timing attacks
-    touch "$tmp_key" "$FILE_KEY" "$FILE_CRT"
-    chown_omsagent "$tmp_key" "$FILE_KEY" "$FILE_CRT"
-    chmod 600 "$tmp_key" "$FILE_KEY" "$FILE_CRT"
-
-    openssl req -subj "/CN=$WORKSPACE_ID/CN=$AGENT_GUID/OU=Linux Monitoring Agent/O=Microsoft" -new -newkey \
-        rsa:2048 -days 365 -nodes -x509 -sha256 -keyout "$tmp_key" -out "$FILE_CRT" > /dev/null 2>&1 || error=$?
-
-    if [ $error -ne 0 -o ! -e "$tmp_key" -o ! -e "$FILE_CRT" ]; then
-        log_error "Error generating certs"
-        clean_exit 1
-    fi
-
-    # Convert key to rsa format for older systems
-    openssl rsa -in "$tmp_key" -out "$FILE_KEY" > /dev/null 2>&1
-    rm "$tmp_key"
 }
 
 set_FQDN()
@@ -351,7 +324,11 @@ onboard()
         log_info "Reusing previous agent GUID"
     else
         AGENT_GUID=`$RUBY -e "require 'securerandom'; print SecureRandom.uuid"`
-        generate_certs
+        $RUBY $MAINTENANCE_TASKS_SCRIPT -c "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" -w "$WORKSPACE_ID" -a "$AGENT_GUID"
+        if [ $? -ne 0 ]; then
+          log_error "Error generating certs"
+          clean_exit 1
+        fi
     fi
 
     if [ -z "$AGENT_GUID" ]; then
@@ -422,8 +399,12 @@ onboard()
     fi
 
     if [ "$RET_CODE" = "200" ]; then
-        apply_dsc_endpoint $RESP_ONBOARD
-        log_info "Onboarding success"
+        $RUBY $MAINTENANCE_TASKS_SCRIPT --dsc "$RESP_ONBOARD" "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" 
+        if [ $? -ne 0 ]; then
+            log_warning "During onboarding request, DSC endpoint may not have been extracted."
+        else
+            log_info "Onboarding success"
+        fi
     elif [ "$RET_CODE" = "403" ]; then
         REASON=`cat $RESP_ONBOARD | sed -n 's:.*<Reason>\(.*\)</Reason>.*:\1:p'`
         log_error "Error onboarding. HTTP code 403, Reason: $REASON. Check the Workspace ID, Workspace Key and that the time of the system is correct."
@@ -463,82 +444,6 @@ onboard()
     return 0
 }
 
-apply_certificate_update_endpoint()
-{
-    # Update the CERTIFICATE_UPDATE_ENDPOINT variable and call renew_cert if the server asks
-    local xml_file=$1
-    # Extract the certificate update endpoint from the server response
-    ENDPOINT_TAG=`grep -o "<CertificateUpdateEndpoint.*CertificateUpdateEndpoint>" $xml_file`
-    CERTIFICATE_UPDATE_ENDPOINT=`echo $ENDPOINT_TAG | grep -o https.*RenewCertificate`
-
-    if [ -z "$CERTIFICATE_UPDATE_ENDPOINT" ]; then
-        log_error "Could not extract the update certificate endpoint."
-        return 1
-    fi
-
-    # Check in the response if the certs should be renewed
-    UPDATE_ATTR=`echo "$ENDPOINT_TAG" | grep -oP "updateCertificate=\"((true|false))\""`
-    if [ -z "UPDATE_ATTR" ]; then
-        log_error "Could not find the updateCertificate tag in the heartbeat response"
-        return 1
-    fi
-
-    if echo "$UPDATE_ATTR" | grep "true"; then
-        renew_cert
-    fi
-}
-
-apply_dsc_endpoint()
-{
-    # Updates the DSC_ENDPOINT variable
-    local xml_file=$1
-    # Extract the DSC endpoint from the server response
-    DSC_CONF=`grep -o "<DscConfiguration.*DscConfiguration>" $xml_file`
-    DSC_ENDPOINT=`echo $DSC_CONF | grep -o "<Endpoint>.*</Endpoint>" | sed -e "s/<.\?Endpoint>//g" -e "s/(/\\\\\(/g" -e "s/)/\\\\\)/g"`
-
-    if [ -z "$DSC_ENDPOINT" ]; then
-        log_error "Could not extract the DSC endpoint."
-        return 1
-    fi
-}
-
-heartbeat()
-{
-    load_config
-
-    # Generate the request body
-    CERT_SERVER=`cat "$FILE_CRT" | awk 'NR>2 { print line } { line = $0 }'`
-    set_FQDN
-
-    `$RUBY $TOPOLOGY_REQ_SCRIPT -t "$BODY_HEARTBEAT" "$OS_INFO" "$CONF_OMSADMIN" "$FQDN" "$AGENT_GUID" "$CERT_SERVER"`
-    [ $? -ne 0 ] && log_error "Error when appending Telemetry to Heartbeat" 
-
-    set_proxy_setting
-
-    REQ_DATE=`date +%Y-%m-%dT%T.%N%:z`
-    RET_CODE=`curl --header "x-ms-Date: $REQ_DATE" \
-        --header "User-Agent: $USER_AGENT" \
-        --header "Accept-Language: en-US" \
-        --insecure \
-        --data-binary @$BODY_HEARTBEAT \
-        --cert "$FILE_CRT" --key "$FILE_KEY" \
-        --output "$RESP_HEARTBEAT" $CURL_VERBOSE \
-        --write-out "%{http_code}\n" $PROXY_SETTING \
-        https://${WORKSPACE_ID}.oms.${URL_TLD}/AgentService.svc/LinuxAgentTopologyRequest`
-
-    if [ "$RET_CODE" = "200" ]; then
-        apply_certificate_update_endpoint $RESP_HEARTBEAT
-        apply_dsc_endpoint $RESP_HEARTBEAT
-        log_info "Heartbeat success"
-
-        # Save the current certificate endpoint url
-        save_config
-    else
-        log_error "Error sending the heartbeat. HTTP code $RET_CODE"
-        return 1
-    fi
-}
-
 renew_cert()
 {
     local error=0
@@ -555,7 +460,11 @@ renew_cert()
     mv "$FILE_CRT" "$FILE_CRT".old
     mv "$FILE_KEY" "$FILE_KEY".old
 
-    generate_certs
+    $RUBY $MAINTENANCE_TASKS_SCRIPT -c "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" -w "$WORKSPACE_ID" -a "$AGENT_GUID"
+    if [ $? -ne 0 ]; then
+      log_error "Error generating certs"
+      clean_exit 1
+    fi
 
     CERT_SERVER=`cat "$FILE_CRT" | awk 'NR>2 { print line } { line = $0 }'`
     echo '<?xml version="1.0"?>' > $BODY_RENEW_CERT
@@ -574,7 +483,8 @@ renew_cert()
 
     if [ "$RET_CODE" = "200" ]; then
         # Do one heartbeat for the server to acknowledge the change
-        heartbeat || error=$?
+        $RUBY $MAINTENANCE_TASKS_SCRIPT -h "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" 
+        error=$?
 
         if [ $error -eq 0 ]; then
             log_info "Certificates successfully renewed"
@@ -649,9 +559,6 @@ create_workspace_directories()
     SHARED_KEY_FILE=$TMP_DIR/shared_key
     BODY_ONBOARD=$TMP_DIR/body_onboard.xml
     RESP_ONBOARD=$TMP_DIR/resp_onboard.xml
-
-    BODY_HEARTBEAT=$TMP_DIR/body_heartbeat.xml
-    RESP_HEARTBEAT=$TMP_DIR/resp_heartbeat.xml
 
     BODY_RENEW_CERT=$TMP_DIR/body_renew_cert.xml
     RESP_RENEW_CERT=$TMP_DIR/resp_renew_cert.xml
@@ -747,9 +654,9 @@ main()
         onboard || clean_exit 1
     fi
 
-    if [ "$HEARTBEAT"  = "1" ]; then
-        heartbeat || clean_exit 1
-    fi
+#    if [ "$HEARTBEAT"  = "1" ]; then
+#        heartbeat || clean_exit 1
+#    fi
 
     if [ "$RENEW_CERT" = "1" ]; then
         renew_cert || clean_exit 1
