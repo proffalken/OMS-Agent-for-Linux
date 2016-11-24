@@ -86,6 +86,7 @@ module Fluent
         def shutdown
             Logger::logInfo "Received shutdown notification"
             stop_npmd()
+            kill_all_agent_instances()
             unless @npmdClientSock.nil?
                 @npmdClientSock.close()
                 @npmdClientSock = nil
@@ -154,7 +155,11 @@ module Fluent
             _lines.each do |line|
                 if line.include?@binary_presence_test_string
                     _staleId = line.split()[1]
-                    Process.kill(STOP_SIGNAL, _staleId.to_i)
+                    begin
+                        Process.kill(STOP_SIGNAL, _staleId.to_i)
+                    rescue Errno::ESRCH
+                        # Process already stopped
+                    end
                 end
             end
         end
